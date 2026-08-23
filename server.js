@@ -119,6 +119,30 @@ function revokeToken(jti, exp) {
 }
 
 /* --------------------------------------------------
+   JWT Middleware
+-------------------------------------------------- */
+
+function authenticateJWT(req, res, next) {
+  const authorization = req.headers.authorization || "";
+  if (!authorization.startsWith("Bearer ")) {
+    return res.status(401).json({ error: "unauthorized", message: "Bearer access token required" });
+  }
+
+  const token = authorization.substring(7);
+  try {
+    const decoded = jwt.verify(token, OAUTH_SECRET);
+    if (decoded.jti && isTokenRevoked(decoded.jti)) {
+      return res.status(401).json({ error: "invalid_token", message: "Token has been revoked" });
+    }
+    req.user = decoded;
+    req.accessToken = token;
+    next();
+  } catch {
+    return res.status(401).json({ error: "invalid_token", message: "Invalid or expired access token" });
+  }
+}
+
+/* --------------------------------------------------
    Device Login HTML
 -------------------------------------------------- */
 
@@ -264,7 +288,12 @@ app.get("/login/device/success", (req, res) => {
   res.send(`<!DOCTYPE html><html><head><title>Device Connected</title></head><body style="background:#111;color:#00ff66;font-family:monospace;padding:30px;"><div style="max-width:600px;margin:auto;background:#1b1b1b;padding:25px;"><h1>Device Connected</h1><p>Account successfully connected: <strong>${device.username}</strong></p></div></body></html>`);
 });
 
-app.post("/oauth/apps", (req, res) => {
+/* --------------------------------------------------
+   OAuth App Management Routes (/api/oauth/apps)
+-------------------------------------------------- */
+
+// Create a new OAuth application
+app.post("/api/oauth/apps", authenticateJWT, (req, res) => {
   const { name, redirect_uri } = req.body;
   if (!name) return res.status(400).json({ error: "application_name_required" });
 
@@ -272,10 +301,43 @@ app.post("/oauth/apps", (req, res) => {
   const clientSecret = generateClientSecret();
   const apps = readJson(APPS_FILE);
 
-  apps.push({ id: randomHex(16), name, client_id: clientId, client_secret: clientSecret, redirect_uri: redirect_uri || null, createdAt: new Date().toISOString() });
+  const newApp = {
+    id: randomHex(16),
+    name,
+    client_id: clientId,
+    client_secret: clientSecret,
+    redirect_uri: redirect_uri || null,
+    user_id: req.user.sub,
+    createdAt: new Date().toISOString()
+  };
+
+  apps.push(newApp);
   writeJson(APPS_FILE, apps);
 
-  res.status(201).json({ status: "success", name, client_id: clientId, client_secret: clientSecret, redirect_uri: redirect_uri || null });
+  res.status(201).json({ status: "success", ...newApp });
+});
+
+// List all registered OAuth applications for the user
+app.get("/api/oauth/apps", authenticateJWT, (req, res) => {
+  const apps = readJson(APPS_FILE);
+  const userApps = apps.filter(app => app.user_id === req.user.sub || !app.user_id);
+  res.json({ success: true, apps: userApps });
+});
+
+// Delete / Revoke an OAuth application by ID
+app.delete("/api/oauth/apps/:id", authenticateJWT, (req, res) => {
+  const appId = req.params.id;
+  let apps = readJson(APPS_FILE);
+  const initialLength = apps.length;
+  
+  apps = apps.filter(app => app.id !== appId);
+  
+  if (apps.length < initialLength) {
+    writeJson(APPS_FILE, apps);
+    res.json({ status: "success", message: "Application deleted successfully" });
+  } else {
+    res.status(404).json({ error: "Application not found" });
+  }
 });
 
 app.post("/oauth2/token", (req, res) => {
@@ -304,31 +366,7 @@ app.post("/oauth2/token", (req, res) => {
 });
 
 /* --------------------------------------------------
-   JWT Middleware
--------------------------------------------------- */
-
-function authenticateJWT(req, res, next) {
-  const authorization = req.headers.authorization || "";
-  if (!authorization.startsWith("Bearer ")) {
-    return res.status(401).json({ error: "unauthorized", message: "Bearer access token required" });
-  }
-
-  const token = authorization.substring(7);
-  try {
-    const decoded = jwt.verify(token, OAUTH_SECRET);
-    if (decoded.jti && isTokenRevoked(decoded.jti)) {
-      return res.status(401).json({ error: "invalid_token", message: "Token has been revoked" });
-    }
-    req.user = decoded;
-    req.accessToken = token;
-    next();
-  } catch {
-    return res.status(401).json({ error: "invalid_token", message: "Invalid or expired access token" });
-  }
-}
-
-/* --------------------------------------------------
-   Additional Custom Endpoints Requested
+   Additional Endpoints
 -------------------------------------------------- */
 
 app.get("/oauth/userinfo", authenticateJWT, (req, res) => {
@@ -348,10 +386,6 @@ app.post("/activate", authenticateJWT, (req, res) => {
   res.json({ status: "activated", username: req.user.username, timestamp: new Date().toISOString() });
 });
 
-/* --------------------------------------------------
-   OAuth Status Endpoint (Added)
--------------------------------------------------- */
-
 app.get("/api/oauth/status", authenticateJWT, (req, res) => {
   res.json({
     authenticated: true,
@@ -365,21 +399,18 @@ app.get("/api/oauth/status", authenticateJWT, (req, res) => {
    VPN API Endpoints
 -------------------------------------------------- */
 
-// 1. List Servers
 app.get("/api/vpn/servers", authenticateJWT, (req, res) => {
   res.json({ success: true, count: vpnServers.length, servers: vpnServers });
 });
 
-// 2. VPN Country List with Flags
 app.get("/api/vpn/countries", authenticateJWT, (req, res) => {
   const countries = vpnServers.map(s => ({ country: s.country, flag: s.flag, serverId: s.id }));
   res.json({ success: true, countries });
 });
 
-// 3. Connect VPN
 app.post("/api/vpn/connect", authenticateJWT, (req, res) => {
   const { serverId } = req.body;
-  const targetServer = vpnServers.find(s => s.id === serverId);
+  const targetServer = vpnServers.find(s => s.id === (serverId || "us-01"));
 
   if (!targetServer) {
     return res.status(404).json({ success: false, message: "VPN Server not found" });
@@ -409,7 +440,6 @@ app.post("/api/vpn/connect", authenticateJWT, (req, res) => {
   });
 });
 
-// 4. Disconnect VPN
 app.post("/api/vpn/disconnect", authenticateJWT, (req, res) => {
   if (vpnConnectionState.status === "disconnected") {
     return res.json({ success: true, message: "VPN is already disconnected" });
@@ -433,18 +463,16 @@ app.post("/api/vpn/disconnect", authenticateJWT, (req, res) => {
   res.json({ success: true, message: "VPN disconnected successfully", connection: vpnConnectionState });
 });
 
-// 5. VPN Status
 app.get("/api/vpn/status", authenticateJWT, (req, res) => {
   res.json({ success: true, connection: vpnConnectionState });
 });
 
-// 6. VPN History
 app.get("/api/vpn/history", authenticateJWT, (req, res) => {
   res.json({ success: true, history: vpnHistory });
 });
 
 /* --------------------------------------------------
-   Standard Auth Management Endpoints
+   Auth Management Endpoints
 -------------------------------------------------- */
 
 app.post("/api/auth/logout", authenticateJWT, (req, res) => {
